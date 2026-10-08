@@ -1,0 +1,40 @@
+{
+  "name": "test-memo",
+  "version": "0.1.0",
+  "description": "Skip node:test files whose inputs have not changed since they last passed, using what each file actually read at runtime.",
+  "type": "module",
+  "bin": {
+    "test-memo": "src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/run.mjs",
+    "./verify": "./src/verify.mjs",
+    "./tracer": "./src/tracer.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "node:test",
+    "test",
+    "cache",
+    "ci",
+    "test-impact-analysis",
+    "memoize",
+    "incremental"
+  ],
+  "author": "Diogo Pinto",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Di0go/test-memo.git"
+  }
+}
