@@ -38,8 +38,11 @@ node --test --import test-memo/tracer   (through NODE_OPTIONS, so children inher
        files read, stat'ed, listed, copied   fs and fs/promises (or --permission-audit)
        globs, and what they matched          fs.glob / fs.globSync
        environment variables read            a Proxy on process.env
-       child processes started               child_process (and the tracer is injected
-                                             into children that get their own env)
+       connections, servers, name lookups    net, dgram, dns
+       child processes started               child_process: Node children get the tracer,
+                                             other programs run under strace (Linux)
+       native addons loaded                  process.dlopen: the file runs under strace
+                                             next time (Linux)
 ```
 
 After the run, each test file that passed is stored with the content hash of every path it
@@ -49,16 +52,45 @@ to the root, so every git worktree and CI workspace of the same project shares o
 
 A stored pass is reused only when all of that still matches, and:
 
-- the Node version, platform, `package.json`, lockfiles and `node --test` flags are the same;
-- it is less than 24 hours old (dates leak into tests more than anyone admits);
+- the Node version, platform, time zone, locale, `package.json`, lockfiles and `node --test`
+  flags are the same;
+- it was proven **on the same calendar day**, in UTC, in the local time zone and in any zone you
+  add, and less than 24 hours ago. The clock is the input nobody declares: a test that compares
+  a fixture with "today" breaks at midnight with no file changing, and this is what reruns it;
 - no input was modified while the run was in progress.
+
+### Programs other than Node, and native addons
+
+What `bash`, `pdftotext` or `php` read, and what a native addon opens by itself, never passes
+through Node. On Linux, with `strace` installed, `test-memo` reads it from the kernel instead:
+
+- a program other than Node that a test starts runs under `strace -f`, put in front of it by the
+  tracer at the moment it is spawned. Every file it and its children opened, stat'ed, listed or
+  executed becomes an input, its executable too, and so does the whole environment it was given;
+- a test file that loads a native addon runs whole under `strace -f` from its second run on, in
+  a second `node --test` next to the first.
+
+The cost stays small because only those processes are traced, and `--seccomp-bpf` stops them only
+on the calls that matter. Without strace (macOS, Windows, a container without it) those files are
+simply never cached.
+
+### The network
+
+A test that connects to a server one of its own processes started is self-contained. A
+connection to anything else, a name lookup, or a UDP socket depends on state no file holds, and
+the file is not cached. When a service's state does come from files, such as a database cloned
+per test from your migrations, declare it in `services`, and those connections count as part of
+the test. A refused connection to this machine (a probe for "nothing listens there") does not
+count.
 
 ### What is never cached
 
 - **A file that failed.** Only passes are remembered.
 - **A file that wrote inside the project** (outside the paths you allow).
-- **A file that ran a program other than Node or git** (`sh`, `docker`, `curl`...), unless you
-  declare that program's output depends only on its arguments. Its reads are invisible.
+- **A file that talked to the network** or to a local service it did not start, unless declared.
+- **A file that ran a program other than Node or git, or loaded a native addon, without strace
+  to see it**, unless you declare the program's output depends only on its arguments
+  (`pureCommands`) or accept the addon (`nativeAddons`).
 - **A file whose own trace is incomplete**, such as a child Node process that never reported
   back.
 
@@ -99,7 +131,11 @@ Options (also in `package.json` under `"testMemo"`):
 | `ignoreEnv` | variables that never count (globs); terminal and session noise is already ignored |
 | `volatileEnv` | variables whose value changes every run but does not matter, such as a database URL with a random name |
 | `allowWrites` | project paths a test may write to and stay cacheable |
-| `pureCommands` | programs whose output depends only on their arguments |
+| `pureCommands` | programs whose output depends only on their arguments (not traced) |
+| `services` | addresses (`host:port`, `unix:/path`, `*` allowed) whose state comes only from files the tests read or from what each test put there |
+| `nativeAddons` | native addons (path fragments) accepted without kernel tracing |
+| `timeZones` | extra zones whose calendar day a pass is bound to |
+| `kernelTrace` | `auto` (default: strace when available) or `off`; also `TEST_MEMO_KERNEL` |
 
 `report.misses` explains every rerun (`file ./src/db.js`, `env DATABASE_URL`, `git state`),
 which is also the fastest way to see which inputs your tests really depend on.
@@ -116,23 +152,29 @@ spawn child processes:
   recorded for that test file: 35 929 accesses, none missing. (The only leftover was a native
   OCR library probing a font folder by relative path, which does not exist.)
 - **Mutation.** One input at a time was broken (a `throw` at the top of a module, a type
-  error, an emptied document) and the whole suite was run: 22 mutations, 439 failing test
-  files in total, **every one of them among the files `test-memo` would have rerun**. Zero
-  false hits.
-- **Selection.** With nothing changed, 358 of the 377 files are skipped; the other 19 run
-  programs whose reads cannot be seen (`bash`, `docker`) and always run. A one-file change
-  reran a median of 29 files; breaking the 10 000-line `server.js` reran 104 (59 of them
-  failed), where a static import-graph selector chose 158.
+  error, an emptied document) and the whole suite was run: 22 mutations on 0.1.0 and 19 on
+  0.2.0, 689 failing test files in total, **every one of them among the files `test-memo`
+  would have rerun**. Zero false hits. Nine of the 0.2.0 mutations were aimed at files only
+  another program reads (shell scripts run by `bash`, a PHP plugin run by `php`, an image put
+  into a PDF), which only the kernel tracing can see.
+- **Selection.** With nothing changed, all but 6 of its 378 files are skipped: those talk to
+  GitHub, to Docker or to a host on the internet, or write into the project, and always run.
+  A one-file change reran a median of 29 files; breaking the 10 000-line `server.js` reran 104
+  (59 of them failed), where a static import-graph selector chose 158.
+- **The network rule found real dependencies** the first version missed: a test reaching a
+  live media server, a deploy script calling GitHub. They are no longer cached.
 
 **[Fastify](https://github.com/fastify/fastify)**, 196 test files and 2 350 tests, unchanged:
-all of them pass under the tracer and all of them are cacheable. `test-memo verify` with ten
-mutations reran exactly the files that broke (1 of 196 for a helper read by one test, 27 for
-the logger, 185 for the error module), and nothing it skipped failed.
+all of them pass under the tracer and all of them are cacheable (one loads a native addon and is
+kernel-traced). `test-memo verify` with ten mutations on 0.2.0: 1 293 failing test files, every
+one of them rerun (1 of 196 for a helper read by one test, 186 for the error module), and
+nothing it skipped failed.
 
-Run the same proof on your own suite:
+Run the same proof on your own suite, at random or on the files you worry about:
 
 ```sh
 npx test-memo verify --mutations=10 test/
+npx test-memo verify --targets=scripts/deploy.sh,fixtures/logo.png test/
 ```
 
 It breaks one committed, unmodified input at a time, runs everything, checks that every failing
@@ -140,42 +182,40 @@ file would have rerun, and puts each file back byte for byte, even on Ctrl-C.
 
 ## How much faster
 
-Measured on 2026-10-08 on a laptop (AMD Ryzen 3 PRO 4450U, 8 threads, Node 26). CPU time is
-user + system, children included.
+Time to run the tests, before and with `test-memo`, on a laptop (2026-10-08).
 
-**Fastify**, 196 test files, the test run alone:
+**Fastify** (196 test files):
 
-| | files run | wall time | CPU time |
-|---|---:|---:|---:|
-| before: plain `node --test` | 196 | 27.7 s | 106 s |
-| first run with `test-memo` (everything runs, traced) | 196 | 29.1 s | 119 s |
-| nothing changed | 0 | 0.1 s | 0.1 s |
-| `lib/logger-pino.js` changed | 27 | 12.9 s | 19.5 s |
-| `lib/error-status.js` changed (read by 185 files) | 185 | 27.7 s | 113 s |
+| What changed | Before | With test-memo |
+|---|---:|---:|
+| Nothing | 27 s | 0.2 s |
+| The logger, read by 27 files | 27 s | 13 s |
+| The error module, read by 185 files | 27 s | 28 s |
 
-**The project above**, its whole pre-push check: 378 test files plus 64 that run against a
-disposable PostgreSQL, and about 10 s of type checking, linting and building that `test-memo`
-does not touch:
+**A larger project** (442 test files, its whole pre-push check):
 
-| | files run | wall time | CPU time |
-|---|---:|---:|---:|
-| before: plain `node --test` | 442 | 61.9 s | 271 s |
-| shadow mode (everything runs, traced) | 442 | 66.7 s | 292 s |
-| skip mode, one script changed | 31 | 18.7 s | 58 s |
-| skip mode, one server module changed | 65 | 38.4 s | 143 s |
+| What changed | Before | With test-memo |
+|---|---:|---:|
+| Nothing | 72 s | 28 s |
+| One script | 72 s | 26 s |
+| One server module | 72 s | 67 s |
 
-The saving follows how far a change reaches. Nothing changed costs a lookup; a change to a
-module that every test loads costs what it cost before, plus the tracing. Tracing adds 5-10 %
-of wall time to the files that actually run, and nothing to the ones that are skipped.
+The saving follows how far a change reaches. The project never drops below about 25 s: its
+check also type-checks, lints and builds, and 12 of its test files always run (they talk to
+the network or write into the project). The first run of each day runs everything again, and
+costs about 10 % more than without `test-memo`, because everything is traced.
 
 ## Limits
 
-- Inputs that are not files, variables or processes are not seen: the clock, the network, a
-  database's state, randomness. A test that depends on them is flaky already; the 24-hour
-  limit and shadow mode are the safety nets.
-- Reads made by native addons straight through libc are not traced (an image library opening a
-  file by path). If the test does not also read that file itself, declare it or keep the test
-  uncacheable.
+- **Luck and the hour.** A test whose verdict depends on randomness, or on the time of day,
+  passes or fails without any input changing. `test-memo` does not roll the dice again until an
+  input changes or the day ends, so such a test shows its failure later than it would have.
+  It was flaky already; the day boundary bounds the delay.
+- **Declared services are a promise.** A service listed in `services` is trusted to hold
+  nothing a file does not. If it does, that state is invisible.
+- **Kernel tracing is Linux with `strace`.** Elsewhere, files that run other programs or load
+  native addons always run. Under strace, `child.pid` is strace's, and killing the child kills
+  strace, which kills the program (`--kill-on-exit`).
 - Needs Node 22.15 or later (`module.registerHooks`). Tested on Node 24 and 26, Linux.
   Windows should work but is not proven yet.
 

@@ -29,6 +29,7 @@ export async function verify({
   nodeArgs = [],
   mutations = 10,
   seed = 1,
+  targets,
   cacheDir,
   log = (l) => process.stderr.write(`${l}\n`),
   ...options
@@ -53,9 +54,15 @@ export async function verify({
     throw new Error(`the suite does not pass as it is (${(warm.failed ?? []).join(", ")}): fix that first`);
 
   // Candidates: files the tests read, by how many test files read them.
+  // Only the results of this configuration: the store keeps others (an older tracer, another
+  // lockfile) side by side, and counting them would double the readers.
+  const store = fs
+    .globSync("v1/*", { cwd: warmDir })
+    .map((d) => ({ d, at: fs.statSync(path.join(warmDir, d)).mtimeMs }))
+    .sort((a, b) => b.at - a.at)[0]?.d;
   const readers = new Map();
-  for (const f of fs.globSync("v1/*/*.json", { cwd: warmDir })) {
-    const entry = JSON.parse(fs.readFileSync(path.join(warmDir, f), "utf8")).entries[0];
+  for (const f of store ? fs.globSync(`${store}/*.json`, { cwd: warmDir }) : []) {
+    const entry = JSON.parse(fs.readFileSync(path.join(warmDir, f), "utf8")).entries?.[0];
     for (const k of Object.keys(entry?.files ?? {}))
       if (k.startsWith("./")) readers.set(k.slice(2), (readers.get(k.slice(2)) ?? 0) + 1);
   }
@@ -80,8 +87,11 @@ export async function verify({
     state = (state * 1103515245 + 12345) % 2 ** 31;
     return state / 2 ** 31;
   };
-  const picks = new Set();
-  for (let i = 0; picks.size < Math.min(mutations, candidates.length) && i < 10_000; i++) {
+  // Or exactly the files asked for: the ones only another program or a native addon reads,
+  // say, which a random pick would rarely land on.
+  const picks = new Set(targets ?? []);
+  for (const file of picks) if (clean && !clean.has(file)) throw new Error(`${file}: not committed and unmodified`);
+  for (let i = 0; !targets && picks.size < Math.min(mutations, candidates.length) && i < 10_000; i++) {
     const q = picks.size % 4;
     const slice = candidates.slice(
       Math.floor((q * candidates.length) / 4),
@@ -130,9 +140,9 @@ export async function verify({
       }
       const failed = report.failed ?? [];
       const rerun = files.length - report.hits.length;
-      results.push({ file, readers: readers.get(file), failed: failed.length, rerun, falseHits: report.falseHits });
+      results.push({ file, readers: readers.get(file) ?? 0, failed: failed.length, rerun, falseHits: report.falseHits });
       log(
-        `  ${file}: read by ${readers.get(file)}, ${failed.length} failed, ${rerun}/${files.length} would rerun` +
+        `  ${file}: read by ${readers.get(file) ?? 0}, ${failed.length} failed, ${rerun}/${files.length} would rerun` +
           (report.falseHits.length ? `, FALSE HITS: ${report.falseHits.map((h) => h.test).join(", ")}` : ""),
       );
     }

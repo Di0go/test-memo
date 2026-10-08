@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // test-memo [--mode shadow|skip|off] [--cache-dir DIR] [--max-age HOURS] [node --test flags] [files or globs]
-// test-memo verify [--mutations N] [--seed S] [node --test flags] [files or globs]
+// test-memo verify [--mutations N] [--seed S] [--targets a,b] [node --test flags] [files or globs]
 //
 // Options can also live in package.json under "testMemo" (mode, cacheDir, maxAgeHours,
-// ignoreEnv, volatileEnv, allowWrites, pureCommands). Flags win over package.json.
+// ignoreEnv, volatileEnv, allowWrites, pureCommands, services, nativeAddons, timeZones,
+// kernelTrace). Flags win over package.json.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -31,6 +32,7 @@ const argv = process.argv.slice(2);
 const command = argv[0] === "verify" ? argv.shift() : "run";
 let mutations = 10;
 let seed = 1;
+let targets;
 const nodeArgs = [];
 const patterns = [];
 for (let i = 0; i < argv.length; i++) {
@@ -42,6 +44,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a.startsWith("--max-age")) config.maxAgeHours = Number(value());
   else if (command === "verify" && a.startsWith("--mutations")) mutations = Number(value());
   else if (command === "verify" && a.startsWith("--seed")) seed = Number(value());
+  else if (command === "verify" && a.startsWith("--targets")) targets = value().split(",").filter(Boolean);
   else if (a === "-h" || a === "--help") {
     process.stdout.write(
       fs
@@ -83,9 +86,13 @@ const common = {
   volatileEnv: config.volatileEnv,
   allowWrites: config.allowWrites,
   pureCommands: config.pureCommands,
+  services: config.services,
+  nativeAddons: config.nativeAddons,
+  timeZones: config.timeZones,
+  kernelTrace: config.kernelTrace,
 };
 if (command === "verify") {
-  const { falseHits } = await verify({ ...common, mutations, seed });
+  const { falseHits } = await verify({ ...common, mutations, seed, targets });
   process.exitCode = falseHits.length ? 1 : 0;
 } else {
   const report = await run({ ...common, mode: config.mode ?? process.env.TEST_MEMO_MODE ?? "shadow" });

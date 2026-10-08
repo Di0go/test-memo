@@ -8,9 +8,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { envRules } from "./env.mjs";
+import { kernelTracer, readKernelTraces, readSpawnTrace } from "./kernel.mjs";
 import { sha, States, writeAtomic } from "./state.mjs";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 const TRACER = fileURLToPath(new URL("./tracer.mjs", import.meta.url));
 const LOCKFILES = [
   "package.json",
@@ -51,6 +52,14 @@ const HOUR = 3600_000;
  * @param {string[]} [o.volatileEnv] variables whose value changes every run but does not matter
  * @param {string[]} [o.allowWrites] project paths (prefixes) a test may write to and stay cacheable
  * @param {string[]} [o.pureCommands] non-Node commands whose output depends only on their arguments
+ * @param {string[]} [o.services]   addresses ("host:port", "unix:/path", globs allowed) of services
+ *                                  whose state comes only from files the tests read, or from what
+ *                                  each test itself put there (a database cloned per test)
+ * @param {string[]} [o.nativeAddons] native addons (path fragments) accepted without kernel tracing
+ * @param {string[]} [o.timeZones]  zones whose calendar day a pass is bound to (UTC and the local
+ *                                  zone always are)
+ * @param {"auto"|"off"} [o.kernelTrace] trace files that run other programs or load native addons
+ *                                  with strace (Linux), so they can be remembered too
  * @param {string} [o.key]          anything else the results depend on
  * @param {(line: string) => void} [o.log]
  */
@@ -69,7 +78,7 @@ export async function run(o) {
   const nodeArgs = o.nodeArgs ?? [];
 
   if (mode === "off") {
-    const status = await nodeTest({ root, files, nodeArgs, env, stdio: o.stdio });
+    const { status } = await nodeTest({ root, files, nodeArgs, env, stdio: o.stdio });
     return { status, mode, files: files.length, ran: files.length, hits: [], stored: 0 };
   }
 
@@ -77,6 +86,23 @@ export async function run(o) {
   const importFlag = `--import=${pathToFileURL(TRACER).href}`;
   const rules = envRules({ root, ignore: o.ignoreEnv, volatile: o.volatileEnv, ownImport: importFlag });
   const states = new States({ statCacheFile: path.join(cacheDir, `stat-${sha(root)}.json`) });
+  // The clock is an input nobody declares. A pass counts only on the calendar day it was
+  // proven, in every zone that could decide what "today" is for the code under test.
+  const zones = [...new Set(["UTC", Intl.DateTimeFormat().resolvedOptions().timeZone, env.TZ, ...(o.timeZones ?? [])])]
+    .filter(Boolean)
+    .filter((zone) => {
+      try {
+        new Intl.DateTimeFormat("en-CA", { timeZone: zone });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const dayFormats = zones.map(
+    (zone) => new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }),
+  );
+  const dayOf = (ms) => dayFormats.map((f) => f.format(ms)).join(" ");
+  const today = dayOf(t0);
   const key = sha(
     JSON.stringify({
       // The tracer itself decides what is recorded: a different tracer is a different cache.
@@ -84,6 +110,8 @@ export async function run(o) {
       node: process.version,
       platform: process.platform,
       arch: process.arch,
+      zones,
+      locale: Intl.DateTimeFormat().resolvedOptions().locale,
       nodeArgs,
       deps: LOCKFILES.map((f) => [f, states.of(path.join(root, f))]),
       key: o.key ?? "",
@@ -109,11 +137,15 @@ export async function run(o) {
   for (const file of files) {
     const entries = readJson(entryFile(file))?.entries ?? [];
     const ctx = { states, fromKey, rules, env, git };
-    const match = entries.find((e) => t0 - e.at < maxAgeMs && matches(e, ctx));
+    const fresh = (e) => t0 - e.at < maxAgeMs && dayOf(e.at) === today;
+    const match = entries.find((e) => fresh(e) && matches(e, ctx));
     if (match) hits.set(file, match);
     else if (entries.length) {
       const newest = entries[0];
-      misses.set(file, t0 - newest.at >= maxAgeMs ? "expired" : mismatch(newest, ctx));
+      misses.set(
+        file,
+        t0 - newest.at >= maxAgeMs ? "expired" : dayOf(newest.at) !== today ? "new day" : mismatch(newest, ctx),
+      );
     } else misses.set(file, "never ran");
   }
   const toRun = mode === "skip" ? files.filter((f) => !hits.has(f)) : files;
@@ -167,13 +199,86 @@ export async function run(o) {
     uncacheable: {},
     falseHits: [],
   };
+  // Programs other than Node run under strace, put in front of them by the tracer as they are
+  // spawned. Test files that, last time, loaded a native addon run whole under strace, in a
+  // second `node --test` next to the first; their output is printed after. The list of those
+  // is relative and lives next to the results, shared by every checkout of the project.
+  const kernelFile = path.join(storeDir, "kernel.json");
+  const kernelSet = new Set(readJson(kernelFile)?.tests ?? []);
+  const kernelArgv = (o.kernelTrace ?? env.TEST_MEMO_KERNEL ?? "auto") === "off" ? null : kernelTracer();
+  if (kernelArgv) {
+    childEnv.TEST_MEMO_STRACE = JSON.stringify(kernelArgv);
+    childEnv.TEST_MEMO_UNTRACED = JSON.stringify(["git", ...PURE, ...(o.pureCommands ?? [])]);
+  }
+  const kernelRun = kernelArgv ? toRun.filter((f) => kernelSet.has(testKey(f))) : [];
+  const plainRun = toRun.filter((f) => !kernelRun.includes(f));
+  const kernelDir = path.join(traceDir, "kernel");
+  report.kernelTraced = kernelRun.length;
+  const NODE_MODULES = `${path.sep}node_modules${path.sep}`;
+  const keep = (abs) => {
+    if (abs.includes(NODE_MODULES)) return false;
+    if (abs === root || abs.startsWith(root + path.sep)) return true;
+    for (const prefix of ignore) if (abs === prefix || abs.startsWith(prefix + path.sep)) return false;
+    return true;
+  };
+
   try {
-    if (toRun.length) status = await nodeTest({ root, files: toRun, nodeArgs, env: childEnv, stdio: o.stdio });
+    const stdio = o.stdio ?? "inherit";
+    const runs = [];
+    if (plainRun.length) runs.push(nodeTest({ root, files: plainRun, nodeArgs, env: childEnv, stdio }));
+    if (kernelRun.length) {
+      fs.mkdirSync(kernelDir);
+      const held = stdio === "inherit";
+      runs.push(
+        nodeTest({
+          root,
+          files: kernelRun,
+          nodeArgs,
+          // Already under strace: a second one inside could not attach.
+          env: { ...childEnv, TEST_MEMO_STRACE: "null" },
+          stdio: held ? ["inherit", "pipe", "pipe"] : stdio,
+          wrap: [...kernelArgv, "-o", path.join(kernelDir, "k")],
+          held,
+        }),
+      );
+    }
+    const done = await Promise.all(runs);
+    status = Math.max(0, ...done.map((d) => d.status));
+    for (const d of done) {
+      if (d.out) process.stdout.write(d.out);
+      if (d.err) process.stderr.write(d.err);
+    }
     report.timings = { lookupMs: tLookup - t0, runMs: Date.now() - tLookup };
     const tRecord = Date.now();
 
     // 3. Read what happened, and write down every file that passed.
-    const traces = readTraces(traceDir);
+    const { byTest: traces, pidTest } = readTraces(traceDir);
+    // Git's own files are covered by the git state (HEAD, refs, status), not one by one.
+    const keepKernel = (abs) => !/[\\/]\.git([\\/]|$)/.test(abs) && keep(abs);
+    const absorb = (t, k) => {
+      for (const r of k.reads) t.reads.add(r);
+      for (const w of k.writes) t.writes.add(w);
+      for (const e of k.execs) t.execs.add(e);
+      t.connects.push(...k.connects);
+      t.listens.push(...k.listens);
+    };
+    if (kernelRun.length) {
+      for (const [test, k] of readKernelTraces(kernelDir, pidTest, keepKernel)) {
+        const t = traces.get(test);
+        if (!t || !kernelRun.includes(test)) continue;
+        t.kernel = true;
+        absorb(t, k);
+      }
+    }
+    for (const t of traces.values()) {
+      for (const s of t.spawns) {
+        if (!s.kernel) continue;
+        const k = readSpawnTrace(s.kernel, pidTest, keepKernel);
+        if (!k) continue;
+        s.traced = true;
+        absorb(t, k);
+      }
+    }
     for (const file of toRun) {
       const t = traces.get(file);
       const outcome = t?.exit;
@@ -183,6 +288,11 @@ export async function run(o) {
       }
       if (hits.has(file) && outcome !== 0) {
         report.falseHits.push({ test: relKey(file), exit: outcome ?? null, entryAt: hits.get(file).at });
+      }
+      if (t) {
+        const needs = needsKernel(t, { addons: o.nativeAddons ?? [] });
+        if (needs) kernelSet.add(testKey(file));
+        else if (t.kernel) kernelSet.delete(testKey(file));
       }
       if (outcome !== 0) continue;
       const why = [];
@@ -196,6 +306,11 @@ export async function run(o) {
         since: t0,
         pure: o.pureCommands ?? [],
         allowWrites: o.allowWrites ?? [],
+        services: o.services ?? [],
+        addons: o.nativeAddons ?? [],
+        kernelAvailable: Boolean(kernelArgv),
+        // A program a test wrote to a scratch folder and ran is part of the test, not an input.
+        scratch: [os.tmpdir(), "/tmp", "/var/tmp", "/dev/shm", cacheDir].map((p) => path.resolve(p)),
         why,
       });
       if (!entry) {
@@ -215,6 +330,7 @@ export async function run(o) {
       report.stored++;
     }
     states.save();
+    if (kernelArgv) writeAtomic(kernelFile, JSON.stringify({ tests: [...kernelSet].sort() }));
     report.timings.recordMs = Date.now() - tRecord;
   } finally {
     if (env.TEST_MEMO_KEEP_TRACES) fs.cpSync(traceDir, env.TEST_MEMO_KEEP_TRACES, { recursive: true });
@@ -264,7 +380,10 @@ function mismatch(entry, { states, fromKey, rules, env, git }) {
   return null;
 }
 
-function buildEntry(t, { root, relKey, states, rules, env, git, since, pure, allowWrites, why }) {
+function buildEntry(
+  t,
+  { root, relKey, states, rules, env, git, since, pure, allowWrites, services, addons, kernelAvailable, scratch, why },
+) {
   if (!t?.rootSeen) return void why.push("no-trace");
   if (t.flags.size) return void why.push([...t.flags][0]);
 
@@ -274,18 +393,29 @@ function buildEntry(t, { root, relKey, states, rules, env, git, since, pure, all
       return void why.push(`writes:${relKey(w)}`);
   }
 
+  // A program other than Node, or a native addon, reads past the tracer: fine only when the
+  // kernel saw this run.
+  const later = (reason) => (kernelAvailable ? `kernel-next-run:${reason}` : reason);
   let needsGit = false;
+  let foreign = false;
   for (const s of t.spawns) {
     if (s.node) continue;
-    const base = path.basename(String(s.cmd)).replace(/\.exe$/i, "");
+    const base = commandName(s.cmd);
     if (base === "git") {
       if (inRoot(s.cwd) || s.gitDir) needsGit = true;
       continue;
     }
-    if (PURE.has(base) || pure.includes(base)) continue;
-    return void why.push(`runs:${base}`);
+    if (PURE.has(base) || pure.includes(base) || s.missing) continue;
+    if (!t.kernel && !s.traced) return void why.push(s.kernel ? `kernel-trace-missing:${base}` : `runs:${base}`);
+    foreign = true;
+  }
+  for (const a of t.addons) {
+    if (t.kernel || addons.some((x) => a.includes(x))) continue;
+    return void why.push(later(`native:${addonName(a)}`));
   }
   if (t.lostChildren) return void why.push(`lost-child:${t.lostChildren}`);
+  const outside = outsider(t, services);
+  if (outside) return void why.push(`network:${outside}`);
 
   const files = {};
   const add = (abs) => {
@@ -317,6 +447,12 @@ function buildEntry(t, { root, relKey, states, rules, env, git, since, pure, all
     if (t.writes.has(abs)) continue; // made by the test itself
     if (!add(abs)) return void why.push(`changed-during-run:${relKey(abs)}`);
   }
+  // A program that was executed is an input like its script: an upgrade can change the answer.
+  for (const abs of t.execs) {
+    if (abs === process.execPath || t.writes.has(abs) || abs.includes(`${path.sep}node_modules${path.sep}`)) continue;
+    if (scratch.some((p) => abs === p || abs.startsWith(p + path.sep))) continue;
+    if (!add(abs)) return void why.push(`changed-during-run:${relKey(abs)}`);
+  }
 
   const trees = {};
   for (const abs of t.trees) trees[relKey(abs)] = states.tree(abs, false);
@@ -332,9 +468,59 @@ function buildEntry(t, { root, relKey, states, rules, env, git, since, pure, all
   if (Object.keys(trees).length) entry.trees = trees;
   if (Object.keys(copies).length) entry.copies = copies;
   if (globs.length) entry.globs = globs;
-  if (t.enumeratedEnv) entry.envAll = rules.whole(env, { withGit: needsGit });
+  // What a program other than Node reads from its environment is invisible: all of it counts.
+  if (t.enumeratedEnv || foreign) entry.envAll = rules.whole(env, { withGit: needsGit });
   if (needsGit) entry.git = git();
   return entry;
+}
+
+function needsKernel(t, { addons }) {
+  return [...t.addons].some((a) => !addons.some((x) => a.includes(x)));
+}
+
+const commandName = (cmd) => path.basename(String(cmd)).replace(/\.exe$/i, "");
+
+function addonName(file) {
+  const parts = file.split(/[\\/]/);
+  const at = parts.lastIndexOf("node_modules");
+  if (at === -1) return path.basename(file);
+  return parts[at + 1]?.startsWith("@") ? `${parts[at + 1]}/${parts[at + 2]}` : parts[at + 1];
+}
+
+const LOCAL = /^(localhost|.+\.localhost|127\.\d+\.\d+\.\d+|::1|0\.0\.0\.0|::|::ffff:127\.\d+\.\d+\.\d+)$/i;
+const hostOf = (host) => (LOCAL.test(String(host ?? "localhost").replace(/^\[|\]$/g, "")) ? "localhost" : String(host).toLowerCase());
+
+function addressOf(k) {
+  if (k.udp) return "udp";
+  if (k.path) return `unix:${k.path}`;
+  return k.port == null ? hostOf(k.host) : `${hostOf(k.host)}:${k.port}`;
+}
+
+function servicePattern(p) {
+  let address = String(p);
+  if (!address.startsWith("unix:") && address !== "udp") {
+    const colon = address.lastIndexOf(":");
+    address = colon > 0 ? `${hostOf(address.slice(0, colon))}:${address.slice(colon + 1)}` : hostOf(address);
+  }
+  return new RegExp(`^${address.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+}
+
+/** The first connection to something the test's own processes did not start, if any. */
+function outsider(t, services) {
+  const ports = new Set(t.listens.filter((l) => l.port).map((l) => l.port));
+  const paths = new Set(t.listens.filter((l) => l.path).map((l) => l.path));
+  const declared = services.map(servicePattern);
+  for (const k of t.connects) {
+    const address = addressOf(k);
+    if (address === "localhost") continue; // a lookup of this machine's own name
+    if (k.path && paths.has(k.path)) continue;
+    if (k.port != null && address === `localhost:${k.port}` && ports.has(k.port)) continue;
+    // A name lookup is declared when some service on that host is.
+    if (declared.some((re) => re.test(address) || (k.port == null && re.test(`${address}:0`)))) continue;
+    if (k.port == null && services.some((p) => String(p).startsWith(`${k.host}:`))) continue;
+    return address;
+  }
+  return null;
 }
 
 function readTraces(dir) {
@@ -354,6 +540,9 @@ function readTraces(dir) {
       env: [],
       enumerated: false,
       spawns: [],
+      addons: [],
+      connects: [],
+      listens: [],
       exit: undefined,
       flags: [],
     };
@@ -370,6 +559,9 @@ function readTraces(dir) {
         else if (kind === "E") p.env.push(JSON.parse(rest));
         else if (kind === "N") p.enumerated = true;
         else if (kind === "S") p.spawns.push(JSON.parse(rest));
+        else if (kind === "A") p.addons.push(JSON.parse(rest));
+        else if (kind === "K") p.connects.push(JSON.parse(rest));
+        else if (kind === "L") p.listens.push(JSON.parse(rest));
         else if (kind === "X") p.exit = Number(rest);
         else if (kind === "U") p.flags.push(rest);
       } catch {
@@ -396,6 +588,11 @@ function readTraces(dir) {
         envReads: new Set(),
         enumeratedEnv: false,
         spawns: [],
+        addons: new Set(),
+        connects: [],
+        listens: [],
+        execs: new Set(),
+        kernel: false,
         flags: new Set(),
         lostChildren: 0,
       };
@@ -414,13 +611,18 @@ function readTraces(dir) {
     if (p.enumerated) t.enumeratedEnv = true;
     for (const f of p.flags) t.flags.add(f);
     t.spawns.push(...p.spawns.map((s) => ({ ...s, from: p.pid })));
+    for (const a of p.addons) t.addons.add(a);
+    t.connects.push(...p.connects);
+    t.listens.push(...p.listens);
     if (p.thread === 0) {
       const direct = p.spawns.filter((s) => s.node && s.via !== "exec" && s.via !== "execSync").length;
       const seen = childrenOf.get(p.pid) ?? 0;
       if (seen < direct) t.lostChildren += direct - seen;
     }
   }
-  return byTest;
+  const pidTest = new Map();
+  for (const p of procs) if (p.thread === 0) pidTest.set(p.pid, p.test);
+  return { byTest, pidTest };
 }
 
 function computeGitState(root) {
@@ -444,11 +646,19 @@ function computeGitState(root) {
   }
 }
 
-function nodeTest({ root, files, nodeArgs, env, stdio = "inherit" }) {
+function nodeTest({ root, files, nodeArgs, env, stdio = "inherit", wrap, held }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--test", ...nodeArgs, ...files], { cwd: root, env, stdio });
+    const argv = [process.execPath, "--test", ...nodeArgs, ...files];
+    const [command, ...args] = wrap ? [...wrap, "--", ...argv] : argv;
+    const child = spawn(command, args, { cwd: root, env, stdio });
+    let out = "";
+    let err = "";
+    if (held) {
+      child.stdout.setEncoding("utf8").on("data", (d) => (out += d));
+      child.stderr.setEncoding("utf8").on("data", (d) => (err += d));
+    }
     child.on("error", reject);
-    child.on("close", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+    child.on("close", (code, signal) => resolve({ status: code ?? (signal ? 1 : 0), out, err }));
   });
 }
 
