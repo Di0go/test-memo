@@ -108,8 +108,8 @@ which is also the fastest way to see which inputs your tests really depend on.
 
 Two real suites, measured on 2026-10-08 (Node 26, Linux):
 
-**A CRM with 377 `node:test` files** that start servers, talk to PostgreSQL, run git and spawn
-child processes:
+**A project with 377 `node:test` files** that start servers, talk to PostgreSQL, run git and
+spawn child processes:
 
 - **Kernel audit.** The whole suite ran under `strace -f`, and every `open`, `stat`, `access`
   and `readlink` the kernel saw inside the project was checked against what `test-memo`
@@ -138,8 +138,35 @@ npx test-memo verify --mutations=10 test/
 It breaks one committed, unmodified input at a time, runs everything, checks that every failing
 file would have rerun, and puts each file back byte for byte, even on Ctrl-C.
 
-Overhead while tracing is 7-10 % of the traced run (25.9 s to 27.9 s on Fastify); only the
-files that actually run pay it.
+## How much faster
+
+Measured on 2026-10-08 on a laptop (AMD Ryzen 3 PRO 4450U, 8 threads, Node 26). CPU time is
+user + system, children included.
+
+**Fastify**, 196 test files, the test run alone:
+
+| | files run | wall time | CPU time |
+|---|---:|---:|---:|
+| before: plain `node --test` | 196 | 27.7 s | 106 s |
+| first run with `test-memo` (everything runs, traced) | 196 | 29.1 s | 119 s |
+| nothing changed | 0 | 0.1 s | 0.1 s |
+| `lib/logger-pino.js` changed | 27 | 12.9 s | 19.5 s |
+| `lib/error-status.js` changed (read by 185 files) | 185 | 27.7 s | 113 s |
+
+**The project above**, its whole pre-push check: 378 test files plus 64 that run against a
+disposable PostgreSQL, and about 10 s of type checking, linting and building that `test-memo`
+does not touch:
+
+| | files run | wall time | CPU time |
+|---|---:|---:|---:|
+| before: plain `node --test` | 442 | 61.9 s | 271 s |
+| shadow mode (everything runs, traced) | 442 | 66.7 s | 292 s |
+| skip mode, one script changed | 31 | 18.7 s | 58 s |
+| skip mode, one server module changed | 65 | 38.4 s | 143 s |
+
+The saving follows how far a change reaches. Nothing changed costs a lookup; a change to a
+module that every test loads costs what it cost before, plus the tracing. Tracing adds 5-10 %
+of wall time to the files that actually run, and nothing to the ones that are skipped.
 
 ## Limits
 
