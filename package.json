@@ -1,6 +1,6 @@
 {
   "name": "test-memo",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Skip node:test files whose inputs have not changed since they last passed, using what each file actually read at runtime.",
   "type": "module",
   "bin": {

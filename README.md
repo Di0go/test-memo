@@ -65,8 +65,10 @@ What `bash`, `pdftotext` or `php` read, and what a native addon opens by itself,
 through Node. On Linux, with `strace` installed, `test-memo` reads it from the kernel instead:
 
 - a program other than Node that a test starts runs under `strace -f`, put in front of it by the
-  tracer at the moment it is spawned. Every file it and its children opened, stat'ed, listed or
-  executed becomes an input, its executable too, and so does the whole environment it was given;
+  tracer at the moment it is spawned. Every file it and its children opened, listed or executed
+  becomes an input, its executable too, and so does the whole environment it was given. A folder
+  it only checked (a `stat`, a `cd`) counts by whether it is there, not by what is in it, or a
+  home folder that changes all day would rerun every shell script;
 - a test file that loads a native addon runs whole under `strace -f` from its second run on, in
   a second `node --test` next to the first.
 

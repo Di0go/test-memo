@@ -11,7 +11,7 @@ import { envRules } from "./env.mjs";
 import { kernelTracer, readKernelTraces, readSpawnTrace } from "./kernel.mjs";
 import { sha, States, writeAtomic } from "./state.mjs";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 const TRACER = fileURLToPath(new URL("./tracer.mjs", import.meta.url));
 const LOCKFILES = [
   "package.json",
@@ -257,6 +257,7 @@ export async function run(o) {
     const keepKernel = (abs) => !/[\\/]\.git([\\/]|$)/.test(abs) && keep(abs);
     const absorb = (t, k) => {
       for (const r of k.reads) t.reads.add(r);
+      for (const r of k.stats) t.stats.add(r);
       for (const w of k.writes) t.writes.add(w);
       for (const e of k.execs) t.execs.add(e);
       t.connects.push(...k.connects);
@@ -447,6 +448,12 @@ function buildEntry(
     if (t.writes.has(abs)) continue; // made by the test itself
     if (!add(abs)) return void why.push(`changed-during-run:${relKey(abs)}`);
   }
+  // What the kernel saw only checked: a folder by whether it is there, anything else by content.
+  for (const abs of t.stats) {
+    if (t.reads.has(abs) || t.writes.has(abs) || files[relKey(abs)] !== undefined) continue;
+    if (states.kind(abs) === "d") exist[relKey(abs)] = "d";
+    else if (!add(abs)) return void why.push(`changed-during-run:${relKey(abs)}`);
+  }
   // A program that was executed is an input like its script: an upgrade can change the answer.
   for (const abs of t.execs) {
     if (abs === process.execPath || t.writes.has(abs) || abs.includes(`${path.sep}node_modules${path.sep}`)) continue;
@@ -592,6 +599,7 @@ function readTraces(dir) {
         connects: [],
         listens: [],
         execs: new Set(),
+        stats: new Set(),
         kernel: false,
         flags: new Set(),
         lostChildren: 0,

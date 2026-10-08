@@ -261,6 +261,26 @@ test("a program that changes folder and writes there by relative path is followe
   }
 });
 
+test("a program that only checks a folder exists does not rerun when a file appears in it; one that lists it does", { skip: !hasStrace }, () => {
+  const sh = (script) =>
+    passes(
+      `import { execFileSync } from "node:child_process";\ntest("s", () => execFileSync("sh", ["-c", ${JSON.stringify(script)}]));`,
+    );
+  const p = project({
+    "data/a.txt": "a",
+    "test/checks.test.mjs": sh("test -d data"),
+    "test/lists.test.mjs": sh("ls data > /dev/null"),
+  });
+  try {
+    p.run();
+    assert.deepEqual(p.run().hits.sort(), ["checks.test.mjs", "lists.test.mjs"]);
+    p.write("data/b.txt", "new");
+    assert.deepEqual(p.run().hits, ["checks.test.mjs"]);
+  } finally {
+    p.cleanup();
+  }
+});
+
 test("a program that does not exist still fails with ENOENT, and the test is remembered", { skip: !hasStrace }, () => {
   const p = project({
     "test/missing.test.mjs": passes(

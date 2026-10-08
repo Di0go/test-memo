@@ -68,7 +68,10 @@ const WRITES = new Set([
 ]);
 const CLONES = new Set(["clone", "clone3", "fork", "vfork"]);
 
-const empty = () => ({ reads: new Set(), writes: new Set(), execs: new Set(), connects: [], listens: [] });
+// `reads`: files opened and folders listed, whose content counts. `stats`: paths only checked
+// (stat, access, a folder opened to work inside it), where for a folder only its existence does;
+// a home folder that changes all day long must not make every shell script a miss.
+const empty = () => ({ reads: new Set(), stats: new Set(), writes: new Set(), execs: new Set(), connects: [], listens: [] });
 
 /**
  * A whole `node --test` that ran under `strace -ff -o <dir>/k`: what each test file's processes
@@ -120,6 +123,7 @@ const LOOPBACK = /^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+|0\.0\.0\.0|
 
 function merge(into, p, keep, node) {
   for (const r of p.reads) if (keep(r)) into.reads.add(r);
+  for (const r of p.stats) if (keep(r)) into.stats.add(r);
   for (const w of p.writes) if (keep(w)) into.writes.add(w);
   for (const e of p.execs) into.execs.add(e);
   for (const c of p.connects) {
@@ -143,7 +147,7 @@ function parseDir(dir) {
   for (const name of names) {
     const tid = Number(name.slice(name.lastIndexOf(".") + 1));
     if (!Number.isInteger(tid)) continue;
-    const p = { reads: new Set(), writes: new Set(), execs: new Set(), connects: [], listens: [] };
+    const p = empty();
     procs.set(tid, p);
     let cwd = null;
     for (const line of fs.readFileSync(path.join(dir, name), "utf8").split("\n")) {
@@ -173,6 +177,7 @@ function parseDir(dir) {
         if (target) (sys === "connect" ? p.connects : p.listens).push(target);
       } else if (sys === "chdir") {
         const d = plain(0);
+        if (d) p.stats.add(d);
         if (ok && d) cwd = d;
       } else if (sys === "fchdir") {
         const d = fdPath(args[0]);
@@ -189,18 +194,19 @@ function parseDir(dir) {
         if (WRITE_FLAGS.test(flags)) {
           if (ok) p.writes.add(file);
           if (/O_RDWR/.test(flags)) p.reads.add(file);
-        } else p.reads.add(file);
+        } else if (/O_DIRECTORY|O_PATH/.test(flags)) p.stats.add(file);
+        else p.reads.add(file);
       } else if (sys === "inotify_add_watch") {
         const file = plain(1);
-        if (file) p.reads.add(file);
+        if (file) p.stats.add(file);
       } else if (WRITES.has(sys)) {
         if (!ok) continue;
         for (const file of writtenPaths(sys, args, cwd)) p.writes.add(file);
       } else {
-        // stat, access, readlink, statfs, getxattr, inotify...: the path is an input whether
-        // or not it exists.
+        // stat, access, readlink, statfs, getxattr...: the path is an input whether or not it
+        // exists.
         const file = sys.endsWith("at") || sys.endsWith("at2") || sys === "statx" ? at(0) : plain(0);
-        if (file) p.reads.add(file);
+        if (file) p.stats.add(file);
       }
     }
   }
